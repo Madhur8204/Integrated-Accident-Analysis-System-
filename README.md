@@ -1,1 +1,413 @@
 # Integrated-Accident-Analysis-System-
+The code is of Ardiuno. This code helps in sharing the live real-time GPS tracking, accident detection using sensors, and automated emergency alerts such as whether the driver is drunk or whether the driver has worn seatbelt or not. 
+
+We have used the C++ programming Language. 
+Code :
+
+ //claude vansh
+#include <TinyGPS++.h>
+#include <HardwareSerial.h>
+#include <Wire.h>
+#include <MPU6050.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+
+// Pin definitions
+#define GPS_RX_PIN 16          // GPS RX pin   tx gps
+#define GPS_TX_PIN 17          // GPS TX pin
+#define GSM_RX_PIN 4           // GSM RX pin     tx gsm
+#define GSM_TX_PIN 5           // GSM TX pin
+#define VIBRATION_SENSOR_PIN 32 // Vibration sensor pin (analog)
+#define ALCOHOL_SENSOR_PIN 34   // Alcohol sensor pin
+#define FSR_SENSOR_PIN 33       // FSR sensor pin for seatbelt detection
+#define BUTTON_PIN 18           // Button pin
+#define LED_PIN 19              // LED pin
+
+// Sensor thresholds
+#define ALCOHOL_THRESHOLD 2000      // Threshold for alcohol detection
+#define ACCELERATION_THRESHOLD 15000 // Threshold for high X-axis acceleration
+#define SEATBELT_WEIGHT_THRESHOLD 80 // Threshold for seatbelt weight detection
+
+// WiFi credentials
+const char* WIFI_SSID = "123456789";     // Replace with your WiFi SSID
+const char* WIFI_PASSWORD = "123456789"; // Replace with your WiFi password
+
+// ThingsBoard credentials
+const char* THINGSBOARD_SERVER = "demo.thingsboard.io";  // Your ThingsBoard server
+const char* ACCESS_TOKEN = "LaI1W7tFlWvtd3t3qG2K";       // Your ThingsBoard access token
+const int THINGSBOARD_PORT = 80;
+
+// Create hardware serial objects for GPS and GSM
+HardwareSerial gpsSerial(1);
+HardwareSerial gsmSerial(2);
+
+// Initialize GPS and MPU
+TinyGPSPlus gps;
+MPU6050 mpu;
+
+// Global variables to store sensor values
+double currentLatitude = 0;
+double currentLongitude = 0;
+int vibrationValue = 0;
+int alcoholValue = 0;
+int seatbeltStatus = 0;
+int16_t ax = 0, ay = 0, az = 0;
+int16_t gx = 0, gy = 0, gz = 0;
+
+// Function Declarations
+void initializeGSM();
+void initializeWiFi();
+void sendPowerOnSMS();
+void sendEmergencyAlert();
+void sendAlcoholAlert(int alcoholValue);
+void sendAccelerationAlert(int ax);
+void sendVibrationAlert(int vibrationValue);
+void sendSeatbeltAlert();
+void sendSMS(String message);
+void readSensors();
+void displayInfo();
+void sendToThingsBoard();
+void sendHTTPPost(String url, String postData);
+int8_t sendATcommand(const char* ATcommand, const char* expected_answer, unsigned int timeout);
+void sendLocationSMS(double latitude, double longitude);
+
+unsigned long lastDataSendTime = 0;
+const unsigned long DATA_SEND_INTERVAL = 10000; // Send data every 10 seconds
+
+void setup() {
+    Serial.begin(9600); // For debugging
+
+    // Initialize GPS Serial
+    gpsSerial.begin(9600, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+    
+    // Initialize GSM Serial
+    gsmSerial.begin(9600, SERIAL_8N1, GSM_RX_PIN, GSM_TX_PIN);
+    delay(3000); // Allow time for GSM module initialization
+    
+    // Configure GSM module
+    gsmSerial.println("AT+CMGF=1"); // Set GSM to text mode
+    delay(1000);
+    
+    // Send power on notification
+    sendPowerOnSMS();
+
+    // Set pin modes
+    pinMode(BUTTON_PIN, INPUT_PULLUP); // Button with internal pull-up
+    pinMode(LED_PIN, OUTPUT);           // LED pin
+
+    // Initialize I2C and MPU6050
+    Wire.begin();
+    mpu.initialize();
+    Serial.println("MPU6050 initialized");
+
+    // Initialize WiFi connection
+    initializeWiFi();
+    
+    // Initialize GSM for SMS
+    initializeGSM();
+    
+    Serial.println("System initialization complete");
+}
+
+void loop() {
+    // Read GPS data
+    while (gpsSerial.available() > 0) {
+        if (gps.encode(gpsSerial.read())) {
+            if (gps.location.isValid()) {
+                currentLatitude = gps.location.lat();
+                currentLongitude = gps.location.lng();
+                displayInfo();
+            }
+        }
+    }
+
+    // Check for GPS signal presence
+    if (millis() > 5000 && gps.charsProcessed() < 10) {
+        Serial.println("No GPS detected");
+        // Don't halt, continue with other functions
+    }
+
+    // Read sensors
+    readSensors();
+
+    // Check if button is pressed for emergency
+    if (digitalRead(BUTTON_PIN) == LOW) { // Button pressed
+        sendEmergencyAlert();
+    }
+
+    // Send data to ThingsBoard periodically
+    if (millis() - lastDataSendTime > DATA_SEND_INTERVAL) {
+        sendToThingsBoard();
+        lastDataSendTime = millis();
+    }
+}
+
+void initializeWiFi() {
+    Serial.println("Connecting to WiFi...");
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+        delay(500);
+        Serial.print(".");
+        attempts++;
+    }
+    
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("\nWiFi connected");
+        Serial.print("IP address: ");
+        Serial.println(WiFi.localIP());
+    } else {
+        Serial.println("\nWiFi connection failed");
+    }
+}
+
+void initializeGSM() {
+    Serial.println("Initializing GSM...");
+    gsmSerial.println("AT");
+    delay(100);
+    gsmSerial.println("AT+CMGF=1"); // Set SMS text mode
+    delay(100);
+    gsmSerial.println("AT+CNMI=1,2,0,0,0"); // New SMS notification
+    delay(100);
+}
+
+void sendAlcoholAlert(int alcoholValue) {
+    if (gps.location.isValid()) {
+        String smsContent = "High Alcohol Level Detected! Location: https://maps.google.com/?q=" 
+                            + String(currentLatitude, 6) + "," + String(currentLongitude, 6) 
+                            + "\nAlcohol Value: " + String(alcoholValue);
+        sendSMS(smsContent);
+    }
+}
+
+void sendAccelerationAlert(int ax) {
+    if (gps.location.isValid()) {
+        String smsContent = "High Acceleration Detected in X-Axis! Location: https://maps.google.com/?q=" 
+                            + String(currentLatitude, 6) + "," + String(currentLongitude, 6) 
+                            + "\nAcceleration X: " + String(ax);
+        sendSMS(smsContent);
+    }
+}
+
+void sendVibrationAlert(int vibrationValue) {
+    if (gps.location.isValid()) {
+        String smsContent = "Vibration Detected! Value: " + String(vibrationValue) + 
+                            "\nLocation: https://maps.google.com/?q=" + String(currentLatitude, 6) 
+                            + "," + String(currentLongitude, 6);
+        sendSMS(smsContent);
+    }
+}
+
+void sendSeatbeltAlert() {
+    if (gps.location.isValid()) {
+        String smsContent = "Seatbelt Warning! Please wear your seatbelt.\nLocation: https://maps.google.com/?q=" 
+                            + String(currentLatitude, 6) + "," + String(currentLongitude, 6);
+        sendSMS(smsContent);
+    }
+}
+
+void sendEmergencyAlert() {
+    if (gps.location.isValid()) {
+        sendLocationSMS(currentLatitude, currentLongitude);
+        
+        // Force immediate data upload to ThingsBoard
+        sendToThingsBoard();
+
+        digitalWrite(LED_PIN, HIGH); // Turn on LED when sending location
+        delay(1000); // Keep LED on for 1 second
+        digitalWrite(LED_PIN, LOW);  // Turn off LED
+    } else {
+        Serial.println("GPS location not valid.");
+    }
+}
+
+void sendPowerOnSMS() {
+    String smsContent = "System Powered On: Device is now active and tracking.";
+    sendSMS(smsContent);
+}
+
+void sendSMS(String message) {
+    gsmSerial.println("AT+CMGS=\"+918956483054\""); // Replace with your phone number
+    delay(1000);
+    gsmSerial.println(message);  // Send the formatted message
+    delay(100);
+    gsmSerial.write(26);  // ASCII code of CTRL+Z to send the message
+    delay(2000); // Wait for the SMS to send
+    Serial.println("SMS sent: " + message);
+}
+
+void readSensors() {
+    vibrationValue = analogRead(VIBRATION_SENSOR_PIN);
+    alcoholValue = analogRead(ALCOHOL_SENSOR_PIN);
+    seatbeltStatus = analogRead(FSR_SENSOR_PIN);
+
+    // Seatbelt alert logic (corrected from original code)
+//    if (seatbeltStatus < SEATBELT_WEIGHT_THRESHOLD) {
+//        Serial.println("Seatbelt not worn with weight detected!");
+//        sendSeatbeltAlert();
+//    } else {
+//        Serial.println("Seatbelt status normal!");
+//    }
+    if (seatbeltStatus < SEATBELT_WEIGHT_THRESHOLD) {
+        Serial.println("Seatbelt not worn with weight detected!");
+        sendSeatbeltAlert();
+    } else {
+        Serial.println("Seatbelt status normal!");
+    }
+
+    if (vibrationValue > 617) {
+        Serial.println("Vibration detected! Value: " + String(vibrationValue));
+        sendVibrationAlert(vibrationValue);
+    } else {
+        Serial.println("No vibration detected. Value: " + String(vibrationValue));
+    }
+
+    if (alcoholValue > ALCOHOL_THRESHOLD) {
+        Serial.print("High Alcohol detected! Value: ");
+        Serial.println(alcoholValue);
+        sendAlcoholAlert(alcoholValue);
+    } else {
+        Serial.print("Alcohol level normal. Value: ");
+        Serial.println(alcoholValue);
+    }
+
+    // Get accelerometer and gyroscope data
+    mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+
+    if (ax > ACCELERATION_THRESHOLD) {
+        Serial.println("High Acceleration in X detected!");
+        sendAccelerationAlert(ax);
+    } else {
+        Serial.print("Acceleration X: "); Serial.println(ax);
+    }
+
+    Serial.print("Accelerometer: X: "); Serial.print(ax);
+    Serial.print(" Y: "); Serial.print(ay);
+    Serial.print(" Z: "); Serial.println(az);
+
+    Serial.print("Gyroscope: X: "); Serial.print(gx);
+    Serial.print(" Y: "); Serial.print(gy);
+    Serial.print(" Z: "); Serial.println(gz);
+    
+    delay(1000); // Add a delay to avoid excessive serial output 
+}
+
+void displayInfo() {
+    if (gps.location.isValid()) {
+        Serial.print("Latitude: ");
+        Serial.println(currentLatitude, 6);
+        Serial.print("Longitude: ");
+        Serial.println(currentLongitude, 6);
+    } else {
+        Serial.println("Location: Not Available");
+    }
+
+    Serial.print("Date: ");
+    if (gps.date.isValid()) {
+        Serial.print(gps.date.month());
+        Serial.print("/");
+        Serial.print(gps.date.day());
+        Serial.print("/");
+        Serial.println(gps.date.year());
+    } else {
+        Serial.println("Not Available");
+    }
+
+    Serial.print("Time: ");
+    if (gps.time.isValid()) {
+        if (gps.time.hour() < 10) Serial.print('0');
+        Serial.print(gps.time.hour());
+        Serial.print(":");
+        if (gps.time.minute() < 10) Serial.print('0');
+        Serial.print(gps.time.minute());
+        Serial.print(":");
+        if (gps.time.second() < 10) Serial.print('0');
+        Serial.println(gps.time.second());
+    } else {
+        Serial.println("Not Available");
+    }
+}
+
+void sendLocationSMS(double latitude, double longitude) {
+    String smsContent = "Emergency! Location: https://maps.google.com/?q=" + String(latitude, 6) + "," + String(longitude, 6);
+    sendSMS(smsContent);
+}
+
+void sendToThingsBoard() {
+    // Check WiFi connection
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("WiFi disconnected, attempting to reconnect...");
+        initializeWiFi();
+        if (WiFi.status() != WL_CONNECTED) {
+            Serial.println("WiFi reconnection failed, using GSM backup");
+            // Use GSM as backup for critical data
+            String payload = "{\"latitude\":" + String(currentLatitude, 6) + 
+                          ", \"longitude\":" + String(currentLongitude, 6) + "}";
+            sendHTTPPost(String(THINGSBOARD_SERVER) + "/api/v1/" + ACCESS_TOKEN + "/telemetry", payload);
+            return;
+        }
+    }
+
+    // Prepare complete payload with all sensor data
+    String payload = "{";
+    payload += "\"latitude\":" + String(currentLatitude, 6) + ",";
+    payload += "\"longitude\":" + String(currentLongitude, 6) + ",";
+    payload += "\"vibration\":" + String(vibrationValue) + ",";
+    payload += "\"alcohol\":" + String(alcoholValue) + ",";
+    payload += "\"seatbelt\":" + String(seatbeltStatus) + ",";
+    payload += "\"accel_x\":" + String(ax) + ",";
+    payload += "\"accel_y\":" + String(ay) + ",";
+    payload += "\"accel_z\":" + String(az) + ",";
+    payload += "\"gyro_x\":" + String(gx) + ",";
+    payload += "\"gyro_y\":" + String(gy) + ",";
+    payload += "\"gyro_z\":" + String(gz);
+    payload += "}";
+
+    // Send data using WiFi
+    HTTPClient http;
+    String url = "http://" + String(THINGSBOARD_SERVER) + "/api/v1/" + ACCESS_TOKEN + "/telemetry";
+    
+    http.begin(url);
+    http.addHeader("Content-Type", "application/json");
+    
+    int httpResponseCode = http.POST(payload);
+    
+    if (httpResponseCode > 0) {
+        String response = http.getString();
+        Serial.println("HTTP Response code: " + String(httpResponseCode));
+        Serial.println("Response: " + response);
+    } else {
+        Serial.println("Error on sending POST: " + String(httpResponseCode));
+        // If WiFi failed, try GSM as backup for critical data
+        String criticalPayload = "{\"latitude\":" + String(currentLatitude, 6) + 
+                              ", \"longitude\":" + String(currentLongitude, 6) + "}";
+        sendHTTPPost(String(THINGSBOARD_SERVER) + "/api/v1/" + ACCESS_TOKEN + "/telemetry", criticalPayload);
+    }
+    
+    http.end();
+}
+
+void sendHTTPPost(String url, String postData) {
+    // This function uses GSM as a backup when WiFi fails
+    Serial.println("Using GSM for data transmission");
+    
+    gsmSerial.println("AT+HTTPINIT");
+    delay(100);
+    gsmSerial.println("AT+HTTPPARA=\"URL\",\"" + url + "\"");
+    delay(100);
+    gsmSerial.println("AT+HTTPPARA=\"CONTENT\",\"application/json\"");
+    delay(100);
+    gsmSerial.println("AT+HTTPDATA=" + String(postData.length()) + ",10000");
+    delay(100);
+    gsmSerial.print(postData);
+    delay(100);
+    gsmSerial.println("AT+HTTPACTION=1");
+    delay(5000); // Wait for HTTP response
+    gsmSerial.println("AT+HTTPREAD");
+    delay(100);
+    gsmSerial.println("AT+HTTPTERM");
+    delay(100);
+    
+    Serial.println("GSM HTTP request completed");
+}
